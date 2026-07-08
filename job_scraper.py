@@ -10,10 +10,13 @@ Setup:
   4. Share the Google Sheet with the service account email
 """
 
+import argparse
 import json
 import os
 import re
 import time
+from typing import Optional
+
 import requests
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, Page, TimeoutError as PlaywrightTimeoutError
@@ -33,9 +36,15 @@ SHEET_HEADERS = [
 
 MAX_PAGES = 10  # Brave's offset param maxes out at 9, so this can't exceed 10
 RESULTS_PER_PAGE = 20
-FRESHNESS = "pw"  # Brave freshness filter: pd=past day, pw=past week, pm=past month, py=past year
 DEBUG = os.environ.get("DEBUG", "").lower() in ("1", "true")
 DEBUG_LIMIT_PER_COMBO = 3  # when DEBUG, cap jobs collected per (search term x ATS site)
+
+# Brave freshness filter per --mode: pd=past day, pw=past week, py=past year.
+MODE_FRESHNESS = {
+    "full": "py",
+    "incremental": "pw",
+    "smoke": "pd",
+}
 
 SEARCH_TERMS = [
     "head of data",
@@ -116,7 +125,7 @@ def detect_ats(url: str) -> str:
 # Brave Search
 # ---------------------------------------------------------------------------
 
-def brave_search(query: str, offset: int = 0) -> list[dict]:
+def brave_search(query: str, offset: int = 0, freshness: Optional[str] = None) -> list[dict]:
     headers = {
         "Accept": "application/json",
         "Accept-Encoding": "gzip",
@@ -128,8 +137,9 @@ def brave_search(query: str, offset: int = 0) -> list[dict]:
         "offset": offset,
         "search_lang": "en",
         "country": "us",
-        "freshness": FRESHNESS,
     }
+    if freshness:
+        params["freshness"] = freshness
     resp = requests.get(BRAVE_SEARCH_URL, headers=headers, params=params, timeout=10)
     resp.raise_for_status()
     data = resp.json()
@@ -566,9 +576,34 @@ def ensure_headers(worksheet) -> set[str]:
 # Main
 # ---------------------------------------------------------------------------
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Search Ashby, Greenhouse, and Lever job postings and append new results to a Google Sheet."
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["full", "incremental", "smoke"],
+        default="incremental",
+        help=(
+            "full: past-year freshness, all search terms and ATS sites (broadest, slowest); "
+            "incremental: past-week freshness, all search terms and ATS sites (default, for scheduled runs); "
+            "smoke: past-day freshness, first search term and first ATS site only, 1 page "
+            "(fast end-to-end test of search -> scrape -> sheet write)"
+        ),
+    )
+    return parser.parse_args()
+
+
 def main():
     from datetime import date
 
+    args = parse_args()
+    freshness = MODE_FRESHNESS[args.mode]
+    search_terms = SEARCH_TERMS[:1] if args.mode == "smoke" else SEARCH_TERMS
+    ats_domains = list(ATS_SITES)[:1] if args.mode == "smoke" else list(ATS_SITES)
+    mode_max_pages = 1 if args.mode == "smoke" else MAX_PAGES
+
+    print(f"Mode: {args.mode} (freshness={freshness or 'none'})")
     print("Connecting to Google Sheet...")
     worksheet = get_sheet(SHEET_ID)
     existing_urls = ensure_headers(worksheet)
@@ -578,17 +613,17 @@ def main():
     new_urls: list[str] = []
     seen: set[str] = set(existing_urls)
 
-    for term in SEARCH_TERMS:
-        for domain in ATS_SITES:
+    for term in search_terms:
+        for domain in ats_domains:
             combo_count = 0
             query = f'site:{domain} "{term}"'
-            max_pages = 1 if DEBUG else MAX_PAGES
+            max_pages = 1 if DEBUG else mode_max_pages
             for search_page in range(max_pages):
                 if DEBUG and combo_count >= DEBUG_LIMIT_PER_COMBO:
                     break
                 offset = search_page  # Brave's offset is a page index (max 9), not a result index
                 print(f'Searching: {query} (offset {offset})...')
-                results = brave_search(query, offset=offset)
+                results = brave_search(query, offset=offset, freshness=freshness)
                 first_url = results[0].get("url", "") if results else ""
                 print(f"  Got {len(results)} result(s). First URL: {first_url}")
                 if not results:
