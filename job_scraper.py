@@ -46,13 +46,8 @@ MODE_FRESHNESS = {
     "smoke": "pd",
 }
 
-SEARCH_TERMS = [
-    "head of data",
-    "head of analytics",
-    "lead data scientist",
-    "product data scientist",
-    "finance data scientist",
-]
+# Used when --title isn't passed at all.
+DEFAULT_SEARCH_TERMS = ["head of data"]
 
 # Maps URL domain fragment → ATS label written to the sheet
 ATS_SITES = {
@@ -591,6 +586,15 @@ def parse_args() -> argparse.Namespace:
             "(fast end-to-end test of search -> scrape -> sheet write)"
         ),
     )
+    parser.add_argument(
+        "--title",
+        action="append",
+        help=(
+            "Job title to search for; repeatable, e.g. --title \"head of data\" "
+            "--title \"director of analytics\". Defaults to "
+            f"{DEFAULT_SEARCH_TERMS!r} if omitted."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -599,7 +603,8 @@ def main():
 
     args = parse_args()
     freshness = MODE_FRESHNESS[args.mode]
-    search_terms = SEARCH_TERMS[:1] if args.mode == "smoke" else SEARCH_TERMS
+    title_terms = args.title if args.title else DEFAULT_SEARCH_TERMS
+    search_terms = title_terms[:1] if args.mode == "smoke" else title_terms
     ats_domains = list(ATS_SITES)[:1] if args.mode == "smoke" else list(ATS_SITES)
     mode_max_pages = 1 if args.mode == "smoke" else MAX_PAGES
 
