@@ -50,8 +50,10 @@ set -a && source .env && set +a
 ## Usage
 
 ```bash
-python3 job_scraper.py --mode <full|incremental|smoke>
+python3 job_scraper.py --mode <full|incremental|smoke> [--title "..."]
 ```
+
+### `--mode`
 
 | Mode | Freshness | Search scope | Use for |
 |---|---|---|---|
@@ -59,11 +61,24 @@ python3 job_scraper.py --mode <full|incremental|smoke>
 | `incremental` (default) | past week (`pw`) | all search terms × all ATS sites | normal scheduled runs |
 | `smoke` | past day (`pd`) | first search term × first ATS site only, 1 page | fast sanity check that search → scrape → sheet-write still works end to end |
 
+### `--title`
+
+Job title to search for. Repeatable — pass it more than once to search multiple titles in a single run:
+
+```bash
+python3 job_scraper.py --title "head of data" --title "director of analytics"
+```
+
+If `--title` is omitted entirely, the search defaults to `["head of data"]`. With `--mode smoke`, only the first title is used regardless of how many are supplied (whether from `--title` or the default), since smoke mode is meant to stay fast.
+
 Examples:
 
 ```bash
-# Normal scheduled run
+# Normal scheduled run (defaults to "head of data")
 python3 job_scraper.py
+
+# Search multiple titles in one run
+python3 job_scraper.py --title "head of data" --title "lead data scientist"
 
 # Quick check that everything's still wired up correctly
 python3 job_scraper.py --mode smoke
@@ -100,4 +115,4 @@ Set `DEBUG=1` to:
 - Only Ashby, Greenhouse, and Lever are supported — other ATS platforms aren't recognized.
 - US-location filtering is heuristic (keyword and state-name matching against the scraped location text), not geocoding — ambiguous locations (e.g. just "Remote") are kept by default.
 - Brave's `offset` parameter caps out at 9, so `MAX_PAGES` can't exceed 10 pages per search query.
-- Search terms and ATS sites are hardcoded lists in the script, not yet exposed as CLI arguments.
+- ATS sites are a hardcoded list in the script, not yet exposed as a CLI argument (search terms are, via `--title`).
