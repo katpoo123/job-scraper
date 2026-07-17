@@ -55,6 +55,8 @@ ATS_SITES = {
     "boards.greenhouse.io": "Greenhouse",
     "job-boards.greenhouse.io": "Greenhouse",
     "jobs.lever.co": "Lever",
+    "myworkdayjobs.com": "Workday",
+    "ats.rippling.com": "Rippling",
 }
 
 SCRAPE_HEADERS = {
@@ -105,6 +107,12 @@ def is_valid_job_url(url: str) -> bool:
         return bool(re.search(r"greenhouse\.io/[^/]+/jobs/\d+", url))
     if "jobs.lever.co" in url:
         # jobs.lever.co/<company>/<uuid>
+        return bool(_UUID_RE.search(url))
+    if "myworkdayjobs.com" in url:
+        # <company>.wd<N>.myworkdayjobs.com/<board>/job/<location>/<title-slug>
+        return bool(re.search(r"myworkdayjobs\.com/[^?#]+/job/[^?#]+", url))
+    if "ats.rippling.com" in url:
+        # ats.rippling.com/<board>/jobs/<uuid>
         return bool(_UUID_RE.search(url))
     return False
 
@@ -528,6 +536,160 @@ def scrape_lever_job(url: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Workday scraper (SPA — requires Playwright)
+# ---------------------------------------------------------------------------
+
+def scrape_workday_job(page: Page, url: str) -> dict:
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    except PlaywrightTimeoutError:
+        pass
+    except Exception:
+        return {}
+
+    # Closed/missing postings redirect off the individual-job URL pattern —
+    # back to the board root or search page (no /job/ segment).
+    if not re.search(r"myworkdayjobs\.com/[^?#]+/job/", page.url):
+        return {}
+
+    for selector in [
+        '[data-automation-id="jobPostingHeader"]',
+        '[data-automation-id="jobPostingPage"]',
+        "h1",
+    ]:
+        try:
+            page.wait_for_selector(selector, timeout=10000)
+            break
+        except PlaywrightTimeoutError:
+            continue
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=5000)
+    except PlaywrightTimeoutError:
+        pass
+
+    soup = BeautifulSoup(page.content(), "html.parser")
+    if soup.find(string=re.compile(r"job (is )?(not available|no longer available)", re.IGNORECASE)):
+        return {}
+    jsonld = _extract_jsonld(soup)
+
+    # Title
+    title = ""
+    if jsonld.get("title"):
+        title = jsonld["title"].strip()
+    else:
+        tag = soup.select_one('[data-automation-id="jobPostingHeader"]') or soup.find("h1")
+        if tag:
+            title = tag.get_text(strip=True)
+
+    # Company
+    company = ""
+    org = jsonld.get("hiringOrganization", {})
+    if isinstance(org, dict) and org.get("name"):
+        company = org["name"].strip()
+    else:
+        m = re.search(r"https?://([^./]+)\.wd\d+\.myworkdayjobs\.com", url)
+        if m:
+            company = m.group(1).replace("-", " ").replace("_", " ").title()
+
+    # Location
+    location_raw, remote = _ashby_location_remote(soup, jsonld)
+    if not location_raw:
+        tag = soup.select_one('[data-automation-id="locations"]')
+        if tag:
+            location_raw = tag.get_text(" ", strip=True)[:200]
+            if re.search(r"\bremote\b", location_raw, re.IGNORECASE):
+                remote = "Yes"
+
+    if not is_us_location(location_raw):
+        return {}
+    salary = _extract_salary(soup, jsonld)
+
+    # Description
+    description = ""
+    tag = soup.select_one('[data-automation-id="jobPostingDescription"]')
+    if tag:
+        description = tag.get_text(" ", strip=True)[:5000]
+    else:
+        description = _ashby_description(soup, jsonld)
+
+    return {
+        "title": title,
+        "company": company,
+        "location": location_raw,
+        "remote": remote,
+        "salary": salary,
+        "description": description,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Rippling scraper (SPA — requires Playwright)
+# ---------------------------------------------------------------------------
+
+def scrape_rippling_job(page: Page, url: str) -> dict:
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    except PlaywrightTimeoutError:
+        pass
+    except Exception:
+        return {}
+
+    # Closed/missing postings redirect off the individual-job URL pattern —
+    # to the board's job list (no uuid) or off Rippling entirely.
+    if not _UUID_RE.search(page.url):
+        return {}
+
+    for selector in ["h1", "[class*='job-title']", "[class*='JobTitle']"]:
+        try:
+            page.wait_for_selector(selector, timeout=10000)
+            break
+        except PlaywrightTimeoutError:
+            continue
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=5000)
+    except PlaywrightTimeoutError:
+        pass
+
+    soup = BeautifulSoup(page.content(), "html.parser")
+    if soup.find(string=re.compile(r"(job not found|no longer accepting applications)", re.IGNORECASE)):
+        return {}
+    jsonld = _extract_jsonld(soup)
+
+    title = _ashby_title(soup, jsonld)
+
+    # Company
+    company = ""
+    org = jsonld.get("hiringOrganization", {})
+    if isinstance(org, dict) and org.get("name"):
+        company = org["name"].strip()
+    else:
+        og = soup.find("meta", property="og:site_name")
+        if og and og.get("content"):
+            company = og["content"].strip()
+        else:
+            m = re.search(r"ats\.rippling\.com/([^/]+)", url)
+            if m:
+                company = m.group(1).replace("-", " ").replace("_", " ").title()
+
+    location_raw, remote = _ashby_location_remote(soup, jsonld)
+    if not is_us_location(location_raw):
+        return {}
+    salary = _extract_salary(soup, jsonld)
+    description = _ashby_description(soup, jsonld)
+
+    return {
+        "title": title,
+        "company": company,
+        "location": location_raw,
+        "remote": remote,
+        "salary": salary,
+        "description": description,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
 
@@ -538,6 +700,10 @@ def scrape_job(browser_page: Page, url: str) -> dict:
         return scrape_greenhouse_job(url)
     if "jobs.lever.co" in url:
         return scrape_lever_job(url)
+    if "myworkdayjobs.com" in url:
+        return scrape_workday_job(browser_page, url)
+    if "ats.rippling.com" in url:
+        return scrape_rippling_job(browser_page, url)
     return {}
 
 

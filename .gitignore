@@ -1,2 +1,4 @@
 .env
 credentials.json
+HANDOFF.md
+compare_search_engines.py
