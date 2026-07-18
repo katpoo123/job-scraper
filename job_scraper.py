@@ -27,12 +27,24 @@ BRAVE_API_KEY = os.environ["BRAVE_API_KEY"]
 SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 CREDENTIALS_FILE = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "credentials.json")
 
+# Optional — free key at https://aistudio.google.com/apikey. When unset, the
+# segmentation columns are left blank.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+# Rolling alias for the current flash model — pinned versions (e.g. gemini-2.5-flash)
+# get retired for new accounts and start 404ing.
+GEMINI_MODEL = "gemini-flash-latest"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+SEGMENT_DELAY_SECONDS = 6  # Gemini free tier allows ~10 requests/minute
+
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 SHEET_HEADERS = [
     "Title", "Company", "Location",
     "Remote", "Salary", "URL", "Date Found", "ATS", "Job Description",
+    "Role Type", "Salary Lower", "Salary Upper", "Office Days", "Commute", "Tooling", "Specialties",
 ]
+# JSON keys returned by segment_job, in the same order as the sheet columns above
+SEGMENT_FIELDS = ["role_type", "salary_lower", "salary_upper", "office_days", "commute", "tooling", "specialties"]
 
 MAX_PAGES = 10  # Brave's offset param maxes out at 9, so this can't exceed 10
 RESULTS_PER_PAGE = 20
@@ -569,7 +581,12 @@ def scrape_workday_job(page: Page, url: str) -> dict:
         pass
 
     soup = BeautifulSoup(page.content(), "html.parser")
-    if soup.find(string=re.compile(r"job (is )?(not available|no longer available)", re.IGNORECASE)):
+    # Workday is an SPA, so removed postings keep the /job/ URL and render an
+    # error message instead ("The page you are looking for doesn't exist." /
+    # "no longer available")
+    if soup.find(string=re.compile(
+        r"(job (is )?(not available|no longer available)"
+        r"|page you are looking for do(es)?n.t exist)", re.IGNORECASE)):
         return {}
     jsonld = _extract_jsonld(soup)
 
@@ -695,16 +712,134 @@ def scrape_rippling_job(page: Page, url: str) -> dict:
 
 def scrape_job(browser_page: Page, url: str) -> dict:
     if "jobs.ashbyhq.com" in url:
-        return scrape_ashby_job(browser_page, url)
-    if "greenhouse.io" in url:
-        return scrape_greenhouse_job(url)
-    if "jobs.lever.co" in url:
-        return scrape_lever_job(url)
-    if "myworkdayjobs.com" in url:
-        return scrape_workday_job(browser_page, url)
-    if "ats.rippling.com" in url:
-        return scrape_rippling_job(browser_page, url)
-    return {}
+        job = scrape_ashby_job(browser_page, url)
+    elif "greenhouse.io" in url:
+        job = scrape_greenhouse_job(url)
+    elif "jobs.lever.co" in url:
+        job = scrape_lever_job(url)
+    elif "myworkdayjobs.com" in url:
+        job = scrape_workday_job(browser_page, url)
+    elif "ats.rippling.com" in url:
+        job = scrape_rippling_job(browser_page, url)
+    else:
+        job = {}
+    # A posting with no extractable title is a dead/error page some check
+    # above didn't recognize — never write it to the sheet.
+    if job and not job.get("title"):
+        return {}
+    return job
+
+
+# ---------------------------------------------------------------------------
+# LLM segmentation (Gemini free tier)
+# ---------------------------------------------------------------------------
+
+SEGMENT_PROMPT = """\
+You are screening job postings for a senior data person based in Oakland, CA.
+Classify the posting below and return JSON with exactly these keys:
+
+role_type — management vs individual contributor:
+- "IC": pure individual-contributor role, no direct reports
+- "Lead (IC-leaning)": lead/staff/principal or player-coach role that is primarily
+  hands-on but might involve some management
+- "Manager": people-management-first role
+- "Unclear": the posting doesn't say
+
+salary_lower / salary_upper — the annual base salary range in USD, from the
+salary field or any pay range in the description, as plain integers with no
+currency symbols or commas (e.g. "230000" and "285000"):
+- when a single figure is stated, use it for both
+- convert hourly/monthly figures to annual equivalents
+- use "" for both when no pay information is stated
+
+office_days — required in-office days per week:
+- "Fully remote" if no office attendance is required
+- "1"–"5" when a specific count is stated (e.g. "3" for 3 days/week hybrid)
+- "Hybrid (unspecified)" when hybrid but no count is given
+- "Unknown" when the posting doesn't say
+
+commute — where the office is relative to Oakland, formatted "<bucket> — <city>"
+(just the bucket when no city is stated):
+- "Oakland": office in Oakland
+- "Bike (Berkeley/Emeryville)": office in Berkeley or Emeryville
+- "BART/Bus (SF)": office in San Francisco
+- "Other Bay Area": elsewhere in the SF Bay Area
+- "Out of area": outside the Bay Area
+- "Remote/Unknown": fully remote or no location given
+
+tooling — rate the data stack, formatted "<rating> — <tools named in posting>"
+(just the rating when no tools are named):
+- "Modern": stack centers on tools like Fivetran, dbt, Snowflake, Hex, BigQuery,
+  Databricks, Airflow, or similar modern data platforms
+- "Mixed": both modern and legacy tools
+- "Legacy": mostly older tools like Tableau, Excel, SSIS, SSRS
+- "Unknown": no tools named
+
+specialties — the role's main domain(s), semicolon-separated, e.g.
+"Machine Learning; Product Analytics; BI; AI; Risk; Data Engineering;
+Experimentation". Pick the closest match(es) or name the domain yourself.
+
+Posting:
+"""
+
+SEGMENT_SCHEMA = {
+    "type": "object",
+    "properties": {field: {"type": "string"} for field in SEGMENT_FIELDS},
+    "required": SEGMENT_FIELDS,
+}
+
+
+def segment_job(job: dict) -> dict:
+    """Classify a scraped job into the segmentation columns via Gemini."""
+    if not GEMINI_API_KEY:
+        return {}
+
+    posting = json.dumps({
+        "title": job.get("title", ""),
+        "company": job.get("company", ""),
+        "location": job.get("location", ""),
+        "remote": job.get("remote", ""),
+        "salary": job.get("salary", ""),
+        "description": job.get("description", ""),
+    })
+    payload = {
+        "contents": [{"parts": [{"text": SEGMENT_PROMPT + posting}]}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": SEGMENT_SCHEMA,
+        },
+    }
+
+    data = {}
+    for attempt in range(2):
+        try:
+            # Key goes in a header, not a query param — exception messages
+            # include the full URL, which would leak the key into logs.
+            resp = requests.post(
+                GEMINI_URL,
+                headers={"x-goog-api-key": GEMINI_API_KEY},
+                json=payload,
+                timeout=60,
+            )
+            if resp.status_code == 429 and attempt == 0:
+                print("    Gemini rate limit hit; waiting 30s...")
+                time.sleep(30)
+                continue
+            resp.raise_for_status()
+            text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+            data = json.loads(text)
+            break
+        except (requests.RequestException, KeyError, IndexError, json.JSONDecodeError) as e:
+            print(f"    Segmentation failed: {e}")
+            break
+
+    time.sleep(SEGMENT_DELAY_SECONDS)  # stay under the free-tier rate limit
+    out = {field: str(data.get(field, "")) for field in SEGMENT_FIELDS}
+    # The model sometimes answers "Unknown" despite the schema — keep the
+    # salary columns strictly numeric or blank.
+    for field in ("salary_lower", "salary_upper"):
+        out[field] = re.sub(r"\D", "", out[field])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -722,7 +857,28 @@ def get_sheet(sheet_id: str):
     return worksheet
 
 
+def append_row_with_retry(worksheet, row: list, attempts: int = 3) -> bool:
+    """Append one row, retrying on transient API/network errors.
+
+    Long scrape runs leave the Sheets connection idle for many minutes, and the
+    first write afterwards can hit a connection reset.
+    """
+    for attempt in range(attempts):
+        try:
+            worksheet.append_rows([row], value_input_option="USER_ENTERED")
+            return True
+        except (requests.RequestException, gspread.exceptions.APIError, ConnectionError) as e:
+            if attempt == attempts - 1:
+                print(f"    Sheet write failed after {attempts} attempts: {e}")
+                return False
+            time.sleep(5 * (attempt + 1))
+    return False
+
+
 def ensure_headers(worksheet) -> set[str]:
+    # Sheets created before the segmentation columns existed have a narrower grid
+    if worksheet.col_count < len(SHEET_HEADERS):
+        worksheet.resize(cols=len(SHEET_HEADERS))
     existing = worksheet.get_all_values()
     if not existing:
         worksheet.append_row(SHEET_HEADERS)
@@ -775,6 +931,8 @@ def main():
     mode_max_pages = 1 if args.mode == "smoke" else MAX_PAGES
 
     print(f"Mode: {args.mode} (freshness={freshness or 'none'})")
+    if not GEMINI_API_KEY:
+        print("GEMINI_API_KEY not set — segmentation columns will be left blank.")
     print("Connecting to Google Sheet...")
     worksheet = get_sheet(SHEET_ID)
     existing_urls = ensure_headers(worksheet)
@@ -811,7 +969,7 @@ def main():
 
     print(f"\nFound {len(new_urls)} new job URL(s) to scrape.")
     today = date.today().isoformat()
-    new_rows = []
+    appended = 0
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
@@ -835,6 +993,7 @@ def main():
                 print("--- END DEBUG ---\n")
             if not job:
                 continue
+            segments = segment_job(job)
             row = [
                 job.get("title", ""),
                 job.get("company", ""),
@@ -845,14 +1004,17 @@ def main():
                 today,
                 ats,
                 job.get("description", ""),
-            ]
-            new_rows.append(row)
+            ] + [segments.get(field, "") for field in SEGMENT_FIELDS]
+            # Append immediately so a crash mid-run doesn't lose prior rows;
+            # already-written rows are skipped by dedupe on the next run.
+            if append_row_with_retry(worksheet, row):
+                appended += 1
+                print(f"    Added to sheet ({appended} so far).")
 
         browser.close()
 
-    if new_rows:
-        worksheet.append_rows(new_rows, value_input_option="USER_ENTERED")
-        print(f"Appended {len(new_rows)} new job(s) to the sheet.")
+    if appended:
+        print(f"Appended {appended} new job(s) to the sheet.")
     else:
         print("No new jobs to add.")
 
