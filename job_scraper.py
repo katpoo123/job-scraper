@@ -34,7 +34,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 # get retired for new accounts and start 404ing.
 GEMINI_MODEL = "gemini-flash-latest"
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-SEGMENT_DELAY_SECONDS = 6  # Gemini free tier allows ~10 requests/minute
+SEGMENT_DELAY_SECONDS = 15  # observed free-tier limit is ~5 requests/minute
 
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -822,8 +822,8 @@ def segment_job(job: dict) -> dict:
                 timeout=60,
             )
             if resp.status_code == 429 and attempt == 0:
-                print("    Gemini rate limit hit; waiting 30s...")
-                time.sleep(30)
+                print("    Gemini rate limit hit; waiting 60s...")
+                time.sleep(60)
                 continue
             resp.raise_for_status()
             text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
