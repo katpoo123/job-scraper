@@ -59,7 +59,12 @@ MODE_FRESHNESS = {
 }
 
 # Used when --title isn't passed at all.
-DEFAULT_SEARCH_TERMS = ["head of data"]
+DEFAULT_SEARCH_TERMS = [
+    "head of data",
+    "lead data scientist",
+    "staff data scientist",
+    "director of analytics",
+]
 
 # Maps URL domain fragment → ATS label written to the sheet
 ATS_SITES = {

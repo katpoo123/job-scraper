@@ -71,7 +71,7 @@ Job title to search for. Repeatable — pass it more than once to search multipl
 python3 job_scraper.py --title "head of data" --title "director of analytics"
 ```
 
-If `--title` is omitted entirely, the search defaults to `["head of data"]`. With `--mode smoke`, only the first title is used regardless of how many are supplied (whether from `--title` or the default), since smoke mode is meant to stay fast.
+If `--title` is omitted entirely, the search defaults to `["head of data", "lead data scientist", "staff data scientist", "director of analytics"]`. With `--mode smoke`, only the first title is used regardless of how many are supplied (whether from `--title` or the default), since smoke mode is meant to stay fast.
 
 Examples:
 
