@@ -116,7 +116,7 @@ Each row appended to the `Jobs` worksheet has these columns:
 
 The last seven columns are produced by a single Gemini call per posting (`gemini-flash-latest` via the [Gemini API free tier](https://ai.google.dev/pricing)), constrained to a JSON schema. The prompt encodes the screening rubric — IC-leaning roles over people management, a normalized numeric salary range, commute buckets relative to Oakland (bike distance to Berkeley/Emeryville, BART to SF), a modern-stack rating anchored on Fivetran/dbt/Snowflake/Hex, and a specialty label. Edit `SEGMENT_PROMPT` in `job_scraper.py` to change the rubric.
 
-Segmentation is best-effort: if the call fails or `GEMINI_API_KEY` is unset, the row is still written with those columns blank. The script sleeps 6s between calls to stay under the free tier's ~10 requests/minute limit.
+Segmentation is best-effort: if the call fails or `GEMINI_API_KEY` is unset, the row is still written with those columns blank. The script sleeps 15s between calls to stay under the free tier's ~5 requests/minute limit.
 
 ## DEBUG mode
 
