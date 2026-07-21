@@ -27,14 +27,17 @@ BRAVE_API_KEY = os.environ["BRAVE_API_KEY"]
 SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 CREDENTIALS_FILE = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "credentials.json")
 
-# Optional — free key at https://aistudio.google.com/apikey. When unset, the
-# segmentation columns are left blank.
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-# Rolling alias for the current flash model — pinned versions (e.g. gemini-2.5-flash)
-# get retired for new accounts and start 404ing.
-GEMINI_MODEL = "gemini-flash-latest"
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-SEGMENT_DELAY_SECONDS = 6  # Gemini free tier allows ~10 requests/minute
+# Optional — free token at https://huggingface.co/settings/tokens. When unset,
+# the segmentation columns are left blank.
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
+# Open-weight Gemma served through HuggingFace Inference Providers, which expose
+# an OpenAI-compatible chat endpoint. Gemma is a gated model — the token's account
+# must accept the license once at https://huggingface.co/google/gemma-3-12b-it.
+# Swap for gemma-3-4b-it (cheaper/faster) or gemma-3-27b-it (higher quality); run
+# GET /v1/models against the router to see which variants your providers serve.
+HF_MODEL = "google/gemma-3-12b-it"
+HF_URL = "https://router.huggingface.co/v1/chat/completions"
+SEGMENT_DELAY_SECONDS = 2  # HF free tier is credit-metered; small pause to be safe
 
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -59,7 +62,12 @@ MODE_FRESHNESS = {
 }
 
 # Used when --title isn't passed at all.
-DEFAULT_SEARCH_TERMS = ["head of data"]
+DEFAULT_SEARCH_TERMS = [
+    "head of data",
+    "lead data scientist",
+    "staff data scientist",
+    "director of analytics",
+]
 
 # Maps URL domain fragment → ATS label written to the sheet
 ATS_SITES = {
@@ -408,7 +416,14 @@ def scrape_greenhouse_job(url: str) -> dict:
 
     soup = BeautifulSoup(resp.text, "html.parser")
     jsonld = _extract_jsonld(soup)
-    if soup.find(string=re.compile(r"Current openings at", re.IGNORECASE)):
+    # A genuine board page shows "Current openings at <company>" as a visible
+    # heading. Greenhouse's Remix app also embeds that phrase in a <script> data
+    # blob on every real job page, so match visible text only — otherwise every
+    # live posting gets dropped as if it were a board page.
+    if any(
+        node.parent.name not in ("script", "style")
+        for node in soup.find_all(string=re.compile(r"Current openings at", re.IGNORECASE))
+    ):
         return {}
 
     # Title
@@ -731,7 +746,7 @@ def scrape_job(browser_page: Page, url: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# LLM segmentation (Gemini free tier)
+# LLM segmentation (Gemma via HuggingFace free tier)
 # ---------------------------------------------------------------------------
 
 SEGMENT_PROMPT = """\
@@ -782,16 +797,10 @@ Experimentation". Pick the closest match(es) or name the domain yourself.
 Posting:
 """
 
-SEGMENT_SCHEMA = {
-    "type": "object",
-    "properties": {field: {"type": "string"} for field in SEGMENT_FIELDS},
-    "required": SEGMENT_FIELDS,
-}
-
 
 def segment_job(job: dict) -> dict:
-    """Classify a scraped job into the segmentation columns via Gemini."""
-    if not GEMINI_API_KEY:
+    """Classify a scraped job into the segmentation columns via Gemma (HuggingFace)."""
+    if not HF_TOKEN:
         return {}
 
     posting = json.dumps({
@@ -803,37 +812,46 @@ def segment_job(job: dict) -> dict:
         "description": job.get("description", ""),
     })
     payload = {
-        "contents": [{"parts": [{"text": SEGMENT_PROMPT + posting}]}],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "responseSchema": SEGMENT_SCHEMA,
-        },
+        "model": HF_MODEL,
+        # Gemma has no system role — the whole instruction goes in the user turn.
+        "messages": [{"role": "user", "content": SEGMENT_PROMPT + posting}],
+        "response_format": {"type": "json_object"},
+        "temperature": 0,
     }
 
     data = {}
     for attempt in range(2):
         try:
-            # Key goes in a header, not a query param — exception messages
-            # include the full URL, which would leak the key into logs.
             resp = requests.post(
-                GEMINI_URL,
-                headers={"x-goog-api-key": GEMINI_API_KEY},
+                HF_URL,
+                headers={"Authorization": f"Bearer {HF_TOKEN}"},
                 json=payload,
                 timeout=60,
             )
             if resp.status_code == 429 and attempt == 0:
-                print("    Gemini rate limit hit; waiting 30s...")
-                time.sleep(30)
+                print("    HuggingFace rate limit hit; waiting 60s...")
+                time.sleep(60)
                 continue
             resp.raise_for_status()
-            text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+            text = resp.json()["choices"][0]["message"]["content"]
+            if not text:
+                # Some providers return null/empty content (filtered or empty
+                # completion); treat it as a failure, not a crash.
+                raise ValueError("empty completion content")
+            # Gemma occasionally wraps JSON in ```json fences — strip them.
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
             data = json.loads(text)
             break
-        except (requests.RequestException, KeyError, IndexError, json.JSONDecodeError) as e:
+        except (requests.RequestException, KeyError, IndexError, ValueError) as e:
+            # json.JSONDecodeError is a subclass of ValueError, so it's covered.
             print(f"    Segmentation failed: {e}")
             break
 
     time.sleep(SEGMENT_DELAY_SECONDS)  # stay under the free-tier rate limit
+    # A provider that ignores response_format can return valid non-object JSON
+    # (an array or scalar); fall back to blank columns rather than crashing.
+    if not isinstance(data, dict):
+        data = {}
     out = {field: str(data.get(field, "")) for field in SEGMENT_FIELDS}
     # The model sometimes answers "Unknown" despite the schema — keep the
     # salary columns strictly numeric or blank.
@@ -931,8 +949,8 @@ def main():
     mode_max_pages = 1 if args.mode == "smoke" else MAX_PAGES
 
     print(f"Mode: {args.mode} (freshness={freshness or 'none'})")
-    if not GEMINI_API_KEY:
-        print("GEMINI_API_KEY not set — segmentation columns will be left blank.")
+    if not HF_TOKEN:
+        print("HF_TOKEN not set — segmentation columns will be left blank.")
     print("Connecting to Google Sheet...")
     worksheet = get_sheet(SHEET_ID)
     existing_urls = ensure_headers(worksheet)

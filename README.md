@@ -10,7 +10,7 @@ Searches Ashby, Greenhouse, and Lever job postings via the Brave Search API, scr
    - **Ashby** postings are a React app, so these are rendered with Playwright (headless Chromium) before parsing.
    - **Greenhouse** and **Lever** postings are server-rendered, so these are fetched directly with `requests` + BeautifulSoup.
    - Non-US postings are filtered out based on location text (see [Known limitations](#known-limitations)).
-4. **Segment** — if `GEMINI_API_KEY` is set, each scraped posting is classified by Gemini (free tier) into fit columns: management vs IC, salary range (lower/upper), office days, commute from Oakland, tooling modernity, and specialties. Without a key these columns are left blank.
+4. **Segment** — if `HF_TOKEN` is set, each scraped posting is classified by Gemma (open-weight, via the HuggingFace free tier) into fit columns: management vs IC, salary range (lower/upper), office days, commute from Oakland, tooling modernity, and specialties. Without a token these columns are left blank.
 5. **Write** — appends new rows to the `Jobs` worksheet in the target Google Sheet.
 
 ## Setup
@@ -40,7 +40,7 @@ Sign up at [api.search.brave.com](https://api.search.brave.com) and grab an API 
 | `BRAVE_API_KEY` | Yes | Brave Search API key from step 2. |
 | `GOOGLE_SHEET_ID` | Yes | The ID from the target sheet's URL (`.../spreadsheets/d/<THIS_PART>/edit`). |
 | `GOOGLE_APPLICATION_CREDENTIALS` | No | Path to the service account key, if not `credentials.json` in the project root. |
-| `GEMINI_API_KEY` | No | Enables the [LLM segmentation columns](#llm-segmentation). Free key at [aistudio.google.com/apikey](https://aistudio.google.com/apikey) — no card required. |
+| `HF_TOKEN` | No | Enables the [LLM segmentation columns](#llm-segmentation). Free token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) (Read scope) — no card required. Also accept the Gemma license once at [huggingface.co/google/gemma-3-12b-it](https://huggingface.co/google/gemma-3-12b-it). |
 | `DEBUG` | No | See [DEBUG mode](#debug-mode). |
 
 A `.env` file works for local development, but the script doesn't load it automatically — export it into your shell first:
@@ -71,7 +71,7 @@ Job title to search for. Repeatable — pass it more than once to search multipl
 python3 job_scraper.py --title "head of data" --title "director of analytics"
 ```
 
-If `--title` is omitted entirely, the search defaults to `["head of data"]`. With `--mode smoke`, only the first title is used regardless of how many are supplied (whether from `--title` or the default), since smoke mode is meant to stay fast.
+If `--title` is omitted entirely, the search defaults to `["head of data", "lead data scientist", "staff data scientist", "director of analytics"]`. With `--mode smoke`, only the first title is used regardless of how many are supplied (whether from `--title` or the default), since smoke mode is meant to stay fast.
 
 Examples:
 
@@ -114,9 +114,9 @@ Each row appended to the `Jobs` worksheet has these columns:
 
 ## LLM segmentation
 
-The last seven columns are produced by a single Gemini call per posting (`gemini-flash-latest` via the [Gemini API free tier](https://ai.google.dev/pricing)), constrained to a JSON schema. The prompt encodes the screening rubric — IC-leaning roles over people management, a normalized numeric salary range, commute buckets relative to Oakland (bike distance to Berkeley/Emeryville, BART to SF), a modern-stack rating anchored on Fivetran/dbt/Snowflake/Hex, and a specialty label. Edit `SEGMENT_PROMPT` in `job_scraper.py` to change the rubric.
+The last seven columns are produced by a single Gemma call per posting (`google/gemma-3-12b-it`, an open-weight model served via [HuggingFace Inference Providers](https://huggingface.co/docs/inference-providers)), requested in JSON mode. The prompt encodes the screening rubric — IC-leaning roles over people management, a normalized numeric salary range, commute buckets relative to Oakland (bike distance to Berkeley/Emeryville, BART to SF), a modern-stack rating anchored on Fivetran/dbt/Snowflake/Hex, and a specialty label. Edit `SEGMENT_PROMPT` in `job_scraper.py` to change the rubric.
 
-Segmentation is best-effort: if the call fails or `GEMINI_API_KEY` is unset, the row is still written with those columns blank. The script sleeps 6s between calls to stay under the free tier's ~10 requests/minute limit.
+Segmentation is best-effort: if the call fails or `HF_TOKEN` is unset, the row is still written with those columns blank. The script sleeps 2s between calls; the HuggingFace free tier is credit-metered rather than strictly rate-limited, so a very large run could exhaust the monthly free credit.
 
 ## DEBUG mode
 
