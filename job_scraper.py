@@ -416,7 +416,14 @@ def scrape_greenhouse_job(url: str) -> dict:
 
     soup = BeautifulSoup(resp.text, "html.parser")
     jsonld = _extract_jsonld(soup)
-    if soup.find(string=re.compile(r"Current openings at", re.IGNORECASE)):
+    # A genuine board page shows "Current openings at <company>" as a visible
+    # heading. Greenhouse's Remix app also embeds that phrase in a <script> data
+    # blob on every real job page, so match visible text only — otherwise every
+    # live posting gets dropped as if it were a board page.
+    if any(
+        node.parent.name not in ("script", "style")
+        for node in soup.find_all(string=re.compile(r"Current openings at", re.IGNORECASE))
+    ):
         return {}
 
     # Title
