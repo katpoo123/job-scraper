@@ -27,14 +27,17 @@ BRAVE_API_KEY = os.environ["BRAVE_API_KEY"]
 SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 CREDENTIALS_FILE = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "credentials.json")
 
-# Optional — free key at https://aistudio.google.com/apikey. When unset, the
-# segmentation columns are left blank.
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-# Rolling alias for the current flash model — pinned versions (e.g. gemini-2.5-flash)
-# get retired for new accounts and start 404ing.
-GEMINI_MODEL = "gemini-flash-latest"
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-SEGMENT_DELAY_SECONDS = 15  # observed free-tier limit is ~5 requests/minute
+# Optional — free token at https://huggingface.co/settings/tokens. When unset,
+# the segmentation columns are left blank.
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
+# Open-weight Gemma served through HuggingFace Inference Providers, which expose
+# an OpenAI-compatible chat endpoint. Gemma is a gated model — the token's account
+# must accept the license once at https://huggingface.co/google/gemma-3-12b-it.
+# Swap for gemma-3-4b-it (cheaper/faster) or gemma-3-27b-it (higher quality); run
+# GET /v1/models against the router to see which variants your providers serve.
+HF_MODEL = "google/gemma-3-12b-it"
+HF_URL = "https://router.huggingface.co/v1/chat/completions"
+SEGMENT_DELAY_SECONDS = 2  # HF free tier is credit-metered; small pause to be safe
 
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -736,7 +739,7 @@ def scrape_job(browser_page: Page, url: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# LLM segmentation (Gemini free tier)
+# LLM segmentation (Gemma via HuggingFace free tier)
 # ---------------------------------------------------------------------------
 
 SEGMENT_PROMPT = """\
@@ -787,16 +790,10 @@ Experimentation". Pick the closest match(es) or name the domain yourself.
 Posting:
 """
 
-SEGMENT_SCHEMA = {
-    "type": "object",
-    "properties": {field: {"type": "string"} for field in SEGMENT_FIELDS},
-    "required": SEGMENT_FIELDS,
-}
-
 
 def segment_job(job: dict) -> dict:
-    """Classify a scraped job into the segmentation columns via Gemini."""
-    if not GEMINI_API_KEY:
+    """Classify a scraped job into the segmentation columns via Gemma (HuggingFace)."""
+    if not HF_TOKEN:
         return {}
 
     posting = json.dumps({
@@ -808,30 +805,30 @@ def segment_job(job: dict) -> dict:
         "description": job.get("description", ""),
     })
     payload = {
-        "contents": [{"parts": [{"text": SEGMENT_PROMPT + posting}]}],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "responseSchema": SEGMENT_SCHEMA,
-        },
+        "model": HF_MODEL,
+        # Gemma has no system role — the whole instruction goes in the user turn.
+        "messages": [{"role": "user", "content": SEGMENT_PROMPT + posting}],
+        "response_format": {"type": "json_object"},
+        "temperature": 0,
     }
 
     data = {}
     for attempt in range(2):
         try:
-            # Key goes in a header, not a query param — exception messages
-            # include the full URL, which would leak the key into logs.
             resp = requests.post(
-                GEMINI_URL,
-                headers={"x-goog-api-key": GEMINI_API_KEY},
+                HF_URL,
+                headers={"Authorization": f"Bearer {HF_TOKEN}"},
                 json=payload,
                 timeout=60,
             )
             if resp.status_code == 429 and attempt == 0:
-                print("    Gemini rate limit hit; waiting 60s...")
+                print("    HuggingFace rate limit hit; waiting 60s...")
                 time.sleep(60)
                 continue
             resp.raise_for_status()
-            text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+            text = resp.json()["choices"][0]["message"]["content"]
+            # Gemma occasionally wraps JSON in ```json fences — strip them.
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
             data = json.loads(text)
             break
         except (requests.RequestException, KeyError, IndexError, json.JSONDecodeError) as e:
@@ -936,8 +933,8 @@ def main():
     mode_max_pages = 1 if args.mode == "smoke" else MAX_PAGES
 
     print(f"Mode: {args.mode} (freshness={freshness or 'none'})")
-    if not GEMINI_API_KEY:
-        print("GEMINI_API_KEY not set — segmentation columns will be left blank.")
+    if not HF_TOKEN:
+        print("HF_TOKEN not set — segmentation columns will be left blank.")
     print("Connecting to Google Sheet...")
     worksheet = get_sheet(SHEET_ID)
     existing_urls = ensure_headers(worksheet)
