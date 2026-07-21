@@ -834,15 +834,24 @@ def segment_job(job: dict) -> dict:
                 continue
             resp.raise_for_status()
             text = resp.json()["choices"][0]["message"]["content"]
+            if not text:
+                # Some providers return null/empty content (filtered or empty
+                # completion); treat it as a failure, not a crash.
+                raise ValueError("empty completion content")
             # Gemma occasionally wraps JSON in ```json fences — strip them.
             text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
             data = json.loads(text)
             break
-        except (requests.RequestException, KeyError, IndexError, json.JSONDecodeError) as e:
+        except (requests.RequestException, KeyError, IndexError, ValueError) as e:
+            # json.JSONDecodeError is a subclass of ValueError, so it's covered.
             print(f"    Segmentation failed: {e}")
             break
 
     time.sleep(SEGMENT_DELAY_SECONDS)  # stay under the free-tier rate limit
+    # A provider that ignores response_format can return valid non-object JSON
+    # (an array or scalar); fall back to blank columns rather than crashing.
+    if not isinstance(data, dict):
+        data = {}
     out = {field: str(data.get(field, "")) for field in SEGMENT_FIELDS}
     # The model sometimes answers "Unknown" despite the schema — keep the
     # salary columns strictly numeric or blank.
