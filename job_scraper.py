@@ -8,6 +8,10 @@ Setup:
   3. Place a service account JSON key at credentials.json (or set
      GOOGLE_APPLICATION_CREDENTIALS env var to its path)
   4. Share the Google Sheet with the service account email
+
+The env vars above (plus the optional HF_TOKEN) may be placed in a .env
+file in the repo root; it is auto-loaded at startup, so no manual
+`source .env` is needed. Real environment variables take precedence.
 """
 
 import argparse
@@ -15,6 +19,7 @@ import json
 import os
 import re
 import time
+from pathlib import Path
 from typing import Optional
 
 import requests
@@ -22,6 +27,12 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, Page, TimeoutError as PlaywrightTimeoutError
 import gspread
 from google.oauth2.service_account import Credentials
+from dotenv import load_dotenv
+
+# Auto-load the .env sitting next to this script, so the required vars are
+# available no matter which directory you launch from. Real environment
+# variables still win over .env values.
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 BRAVE_API_KEY = os.environ["BRAVE_API_KEY"]
 SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
